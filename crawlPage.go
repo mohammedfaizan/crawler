@@ -3,66 +3,113 @@ package main
 import (
     "net/url"
     "fmt"
+	"sync"
 )
 
-func crawlPage(rawBaseURL, rawCurrentURL string, pages map[string]int) (map[string]int, error) {
-    fmt.Printf("Crawling: %s\n", rawCurrentURL)
+type config struct {
+	pages			   map[string]int
+	baseURL 		   *url.URL
+	mu				   *sync.Mutex
+	concurrencyControl chan struct{}
+	wg				   *sync.WaitGroup
+	maxPages		   int
+}
 
-    parsedBaseURL, err := url.Parse(rawBaseURL)
+func (cfg *config) crawlPage(rawCurrentURL string) error {
+    defer cfg.wg.Done()
+
+	cfg.mu.Lock()
+	if len(cfg.pages) >= cfg.maxPages {
+		cfg.mu.Unlock()
+		return fmt.Errorf("max pages reached")
+	}
+	cfg.mu.Unlock()
+
+	select {
+    case cfg.concurrencyControl <- struct{}{}:
+        defer func() { <-cfg.concurrencyControl }()
+    default:
+        return nil
+    }
+
+	
+
+
+    parsedBaseURL, err := url.Parse(cfg.baseURL.String())
     if err != nil {
-        return pages, fmt.Errorf("error parsing base URL: %v", err)
+        return fmt.Errorf("error parsing base URL: %v", err)
 	}
     
 	if err != nil {
-		return pages, fmt.Errorf("error parsing base URL: %v", err)
+		return fmt.Errorf("error parsing base URL: %v", err)
 	}
     parsedCurrentURL, err := url.Parse(rawCurrentURL)
     if err != nil {
-        return pages, fmt.Errorf("error parsing current URL: %v", err)
+        return fmt.Errorf("error parsing current URL: %v", err)
 	}
 	
 
     if parsedBaseURL.Host != parsedCurrentURL.Host {
         fmt.Printf("Skipping external URL: %s (Base host: %s, Current host: %s)\n", 
            rawCurrentURL, parsedBaseURL.Host, parsedCurrentURL.Host)
-        return pages, nil
-	}
-	fmt.Println(rawCurrentURL)
-    normalizedCurrentURL, err := normalizeURL(rawCurrentURL)
-	if err != nil {
-		fmt.Println("error normalizing the url")
-		return pages, err
-	}
-	fmt.Println(normalizedCurrentURL)
-    if _, exists := pages[normalizedCurrentURL]; exists {
-        fmt.Printf("Already crawled: %s\n", normalizedCurrentURL)
-        pages[normalizedCurrentURL]++
-		return pages, nil
+        return nil
 	}
 
-    pages[normalizedCurrentURL] = 1
+    normalizedCurrentURL, err := normalizeURL(rawCurrentURL)
+	if err != nil {
+		return err
+	}
+	fmt.Println(normalizedCurrentURL)
+    if _, exists := cfg.pages[normalizedCurrentURL]; exists {
+        fmt.Printf("Already crawled: %s\n", normalizedCurrentURL)
+        cfg.pages[normalizedCurrentURL]++
+		return nil
+	}
+
+    cfg.pages[normalizedCurrentURL] = 1
     htmlContent, err := getHTML(normalizedCurrentURL)
     if err != nil {
-        fmt.Println("err getting the html content", err)
-        return pages, err
+        
+        return err
 	}
-	fmt.Printf("Got HTML content for: %s\n", normalizedCurrentURL) 
+	
 
     urls, err := getURLsFromHTML(htmlContent, normalizedCurrentURL)
     if err != nil {
         fmt.Println("err getting the urls", err)
-        return pages, err
+        return err
 	}
 
-    fmt.Printf("Found %d URLs on page: %s\n", len(urls), normalizedCurrentURL)
 
     for _, url := range urls {
-        pages, err = crawlPage(rawBaseURL, url, pages)
-        if err != nil {
-                fmt.Printf("Error crawling %s: %v\n", url, err)
-                // Continue crawling other URLs even if one fails
+		
+		cfg.mu.Lock()
+        if len(cfg.pages) >= cfg.maxPages {
+            cfg.mu.Unlock()
+            return nil
+        }
+        cfg.mu.Unlock()
+
+
+        if cfg.addPageVisit(url) {
+			cfg.wg.Add(1)
+			cfg.crawlPage(url)
 		}
 	}
 
-	return pages, nil
+	return nil
+}
+
+func (cfg *config) addPageVisit(normalizedCurrentURL string) (isFirst bool) {
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
+
+	if len(cfg.pages) >= cfg.maxPages {
+        return false
+    }
+
+	if _, exists := cfg.pages[normalizedCurrentURL]; exists {
+		return false
+	}
+	return true
 }
